@@ -6,7 +6,7 @@ on:
     branches:
       - main
 
-jobs:a
+jobs:
   build:
     name: Gateio Pro Scalper Advanced - ONN 100071481A
     runs-on: ubuntu-22.04
