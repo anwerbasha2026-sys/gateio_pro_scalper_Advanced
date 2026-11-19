@@ -825,10 +825,19 @@ def verify_symbol_tradable_now(symbol):
     return True, "متاح للتداول الفوري"
 
 
-def get_top_200_symbols():
+def get_top_symbols(limit=200, min_quote_vol=50000.0):
     """
-    جلب أعلى 200 عملة سيولة من عملات Spot المعتمدة في fetch_gateio_spot_tradable_whitelist.
+    جلب أعلى عملات السيولة (حسب العدد المحدد من المستخدم) من عملات Spot المعتمدة على Gate.io.
     """
+    try:
+        scan_limit = max(5, min(1500, int(limit)))
+    except (TypeError, ValueError):
+        scan_limit = 200
+    try:
+        min_vol = max(0.0, float(min_quote_vol))
+    except (TypeError, ValueError):
+        min_vol = 50000.0
+
     whitelist = fetch_gateio_spot_tradable_whitelist()
     if not whitelist:
         return []
@@ -846,19 +855,23 @@ def get_top_200_symbols():
                 quote_vol = float(item.get("quote_volume", 0) or 0)
                 bid_p = float(item.get("highest_bid", 0) or 0)
                 ask_p = float(item.get("lowest_ask", 0) or 0)
-                if quote_vol >= 50000 and bid_p > 0 and ask_p > 0:
+                if quote_vol >= min_vol and bid_p > 0 and ask_p > 0:
                     item["_norm_sym"] = sym
                     item["_quote_vol"] = quote_vol
                     usdt_pairs.append(item)
 
             usdt_pairs.sort(key=lambda x: x["_quote_vol"], reverse=True)
-            top_list = [item["_norm_sym"] for item in usdt_pairs[:200]]
+            top_list = [item["_norm_sym"] for item in usdt_pairs[:scan_limit]]
             if top_list:
                 return top_list
     except Exception as e:
         print(f"خطأ في ترتيب السيولة على Gate.io: {e}")
 
-    return sorted(list(whitelist))[:200]
+    return sorted(list(whitelist))[:scan_limit]
+
+
+def get_top_200_symbols():
+    return get_top_symbols(limit=200)
 
 
 def get_gateio_real_price(symbol):
@@ -1282,6 +1295,53 @@ def calculate_macd_series(closes, fast_period=12, slow_period=26, signal_period=
     return aligned_macd, signal_line, histogram
 
 
+def calculate_bollinger_bands(closes, period=20, num_std=2.0):
+    """حساب مؤشر البولينجر باند (Upper, Mid, Lower, Bandwidth %) بدون مكتبات خارجية."""
+    if len(closes) < period:
+        return [], [], [], []
+    upper_list, mid_list, lower_list, bw_list = [], [], [], []
+    for i in range(period - 1, len(closes)):
+        window = closes[i - period + 1:i + 1]
+        mean = sum(window) / period
+        variance = sum((x - mean) ** 2 for x in window) / period
+        std = math.sqrt(variance)
+        up = mean + num_std * std
+        lo = mean - num_std * std
+        bw = ((up - lo) / mean * 100.0) if mean > 0 else 0.0
+        upper_list.append(up)
+        mid_list.append(mean)
+        lower_list.append(lo)
+        bw_list.append(bw)
+    return upper_list, mid_list, lower_list, bw_list
+
+
+def calculate_stoch_rsi(closes, rsi_period=14, stoch_period=14, k_smooth=3, d_smooth=3):
+    """حساب مؤشر Stochastic RSI (%K و %D) لالتقاط تقاطعات الزخم المبكرة."""
+    rsi_vals = calculate_rsi_series(closes, period=rsi_period)
+    if len(rsi_vals) < stoch_period + k_smooth + d_smooth:
+        return [], []
+    raw_k = []
+    for i in range(stoch_period - 1, len(rsi_vals)):
+        win = rsi_vals[i - stoch_period + 1:i + 1]
+        lo = min(win)
+        hi = max(win)
+        if hi == lo:
+            raw_k.append(50.0)
+        else:
+            raw_k.append(((rsi_vals[i] - lo) / (hi - lo)) * 100.0)
+
+    k_series = []
+    for i in range(k_smooth - 1, len(raw_k)):
+        k_series.append(sum(raw_k[i - k_smooth + 1:i + 1]) / k_smooth)
+
+    d_series = []
+    for i in range(d_smooth - 1, len(k_series)):
+        d_series.append(sum(k_series[i - d_smooth + 1:i + 1]) / d_smooth)
+
+    aligned_k = k_series[d_smooth - 1:]
+    return aligned_k, d_series
+
+
 def fetch_klines(formatted_symbol, interval, limit=500):
     """
     جلب الشموع اليابانية من Gate.io (/api/v4/spot/candlesticks) وتحويل كل شمعة
@@ -1377,16 +1437,29 @@ def check_trade_conditions_from_main(
     symbol, vol_multiplier=1.2, enable_low_price_change_filter=True,
     max_price_change_pct=0.60, enable_order_book_filter=True,
     enable_rsi_filter=True, rsi_min=45.0, rsi_max=70.0,
-    enable_macd_filter=True
+    enable_macd_filter=True,
+    enable_strat_trend=True,
+    enable_strat_bb_breakout=True,
+    enable_strat_rsi_bounce=True,
+    enable_strat_ema_cross=True,
 ):
-    """إشارة شراء من شموع 5m المغلقة مع تأكيد EMA9>EMA21>EMA200 و RSI و MACD و VWAP ودفتر الأوامر."""
+    """
+    محرك القنص متعدد الاستراتيجيات (Multi-Strategy Scalping Engine) على شموع 5m المغلقة:
+    1. اتجاه صاعد + تجميع (EMA9>EMA21>EMA200 + VWAP + 15m/1h)
+    2. انفجار البولينجر (Bollinger Squeeze Breakout + فوليوم)
+    3. ارتداد القاع والتشبع البيعي (RSI Oversold Bounce + بولينجر سفلي)
+    4. تقاطع الزخم السريع (EMA 9/21 Golden Cross + StochRSI + VWAP)
+    مع بوابة أمان موحدة لفحص دفتر الأوامر والسبريد قبل الدخول.
+    """
     try:
         formatted_symbol = to_gate_pair(symbol)
         if formatted_symbol in BLACKLISTED_SYMBOLS or not is_clean_spot_crypto_pair(formatted_symbol):
             return False, 0.0, "الزوج مستبعد"
+
         klines = fetch_klines(formatted_symbol, "5m", limit=300)
         if not klines or len(klines) < 202:
             return False, 0.0, "تعذر جلب البيانات الكافية"
+
         closed = klines[:-1]
         opens = [float(k[1]) for k in closed]
         highs = [float(k[2]) for k in closed]
@@ -1394,71 +1467,174 @@ def check_trade_conditions_from_main(
         closes = [float(k[4]) for k in closed]
         volumes = [float(k[5]) for k in closed]
         price = closes[-1]
+        op = opens[-1]
+        prev_close = closes[-2]
+
         e9 = calculate_ema_series(closes, 9)
         e21 = calculate_ema_series(closes, 21)
+        e50 = calculate_ema_series(closes, 50)
         e200 = calculate_ema_series(closes, 200)
-        if not (e9 and e21 and e200):
+        if not (e9 and e21 and e50 and e200):
             return False, price, "بيانات EMA غير كافية"
-        if not (e9[-1] > e21[-1] > e200[-1] and price > e9[-1]):
-            return False, price, "ترتيب EMA9/EMA21/EMA200 غير صاعد على 5m"
 
-        # فحص مؤشر RSI (14) إذا كان مفعلاً من الواجهة
-        rsi_tag = ""
-        if enable_rsi_filter:
-            rsi_series = calculate_rsi_series(closes, period=14)
-            if not rsi_series:
-                return False, price, "بيانات RSI غير كافية"
-            curr_rsi = rsi_series[-1]
-            low_bound = min(float(rsi_min), float(rsi_max))
-            high_bound = max(float(rsi_min), float(rsi_max))
-            if curr_rsi < low_bound:
-                return False, price, f"زخم RSI ضعيف ({curr_rsi:.1f} < {low_bound:.0f})"
-            if curr_rsi > high_bound:
-                return False, price, f"تشبع شرائي في RSI ({curr_rsi:.1f} > {high_bound:.0f})"
-            rsi_tag = f" | RSI={curr_rsi:.1f}"
+        rsi_series = calculate_rsi_series(closes, period=14)
+        curr_rsi = rsi_series[-1] if rsi_series else None
+        prev_rsi = rsi_series[-2] if len(rsi_series) >= 2 else None
 
-        # فحص مؤشر MACD (12, 26, 9) إذا كان مفعلاً من الواجهة
-        macd_tag = ""
-        if enable_macd_filter:
-            macd_line, sig_line, hist = calculate_macd_series(closes, 12, 26, 9)
-            if not hist or len(hist) < 2:
-                return False, price, "بيانات MACD غير كافية"
-            if not (macd_line[-1] > sig_line[-1] and hist[-1] > 0):
-                return False, price, f"إشارة MACD سلبية (MACD={macd_line[-1]:.6f} <= Signal={sig_line[-1]:.6f})"
-            macd_tag = " | MACD صاعد"
+        macd_line, sig_line, hist = calculate_macd_series(closes, 12, 26, 9)
+        bb_up, bb_mid, bb_lo, bb_bw = calculate_bollinger_bands(closes, period=20, num_std=2.0)
+        stoch_k, stoch_d = calculate_stoch_rsi(closes, 14, 14, 3, 3)
 
         total_vol = sum(volumes[-20:])
         vwap = (
             sum(((highs[i] + lows[i] + closes[i]) / 3) * volumes[i] for i in range(-20, 0)) / total_vol
             if total_vol > 0 else price
         )
-        avg_vol = sum(volumes[-10:-1]) / 9
-        if avg_vol <= 0 or volumes[-1] <= avg_vol * float(vol_multiplier):
-            return False, price, f"الفوليوم ضعيف (< {vol_multiplier}x من المتوسط)"
-        op = opens[-1]
-        prev = closes[-2]
-        body_pct = abs(price - op) / op * 100 if op > 0 else 999
-        close_pct = abs(price - prev) / prev * 100 if prev > 0 else 999
-        range_pct = (highs[-1] - lows[-1]) / lows[-1] * 100 if lows[-1] > 0 else 999
-        effective_pct = max(body_pct, close_pct)
-        if enable_low_price_change_filter:
-            limit_pct = abs(float(max_price_change_pct))
-            if effective_pct > limit_pct or range_pct > limit_pct * 1.6:
-                return False, price, f"التغير السعري كبير ({effective_pct:.2f}%)"
-        if price < vwap:
-            return False, price, "السعر دون VWAP"
-        if not check_ema200_trend(formatted_symbol, "15m"):
-            return False, price, "تأكيد EMA غير صاعد على 15m"
-        if not check_ema200_trend(formatted_symbol, "1h"):
-            return False, price, "تأكيد EMA غير صاعد على 1h"
+        avg_vol = sum(volumes[-10:-1]) / 9.0
+        vol_ratio = (volumes[-1] / avg_vol) if avg_vol > 0 else 0.0
+
+        matched_signal = None
+        reject_reasons = []
+
+        # ------------------------------------------------------------------
+        # الاستراتيجية 1: اتجاه صاعد + تجميع (الأصلية)
+        # ------------------------------------------------------------------
+        if enable_strat_trend:
+            trend_ok = True
+            trend_reason = ""
+            rsi_tag = ""
+            macd_tag = ""
+
+            if not (e9[-1] > e21[-1] > e200[-1] and price > e9[-1]):
+                trend_ok = False
+                trend_reason = "EMA غير صاعد"
+            elif enable_rsi_filter:
+                if curr_rsi is None:
+                    trend_ok = False
+                    trend_reason = "RSI غير متاح"
+                else:
+                    low_b = min(float(rsi_min), float(rsi_max))
+                    high_b = max(float(rsi_min), float(rsi_max))
+                    if curr_rsi < low_b or curr_rsi > high_b:
+                        trend_ok = False
+                        trend_reason = f"RSI={curr_rsi:.1f}"
+                    else:
+                        rsi_tag = f" | RSI={curr_rsi:.1f}"
+
+            if trend_ok and enable_macd_filter:
+                if not hist or len(hist) < 2 or not (macd_line[-1] > sig_line[-1] and hist[-1] > 0):
+                    trend_ok = False
+                    trend_reason = "MACD سلبي"
+                else:
+                    macd_tag = " | MACD صاعد"
+
+            if trend_ok and (avg_vol <= 0 or volumes[-1] <= avg_vol * float(vol_multiplier)):
+                trend_ok = False
+                trend_reason = f"فوليوم {vol_ratio:.2f}x"
+
+            if trend_ok and enable_low_price_change_filter:
+                body_pct = abs(price - op) / op * 100 if op > 0 else 999
+                close_pct = abs(price - prev_close) / prev_close * 100 if prev_close > 0 else 999
+                range_pct = (highs[-1] - lows[-1]) / lows[-1] * 100 if lows[-1] > 0 else 999
+                effective_pct = max(body_pct, close_pct)
+                limit_pct = abs(float(max_price_change_pct))
+                if effective_pct > limit_pct or range_pct > limit_pct * 1.6:
+                    trend_ok = False
+                    trend_reason = f"تغير {effective_pct:.2f}%"
+
+            if trend_ok and price < vwap:
+                trend_ok = False
+                trend_reason = "دون VWAP"
+
+            if trend_ok:
+                if not check_ema200_trend(formatted_symbol, "15m"):
+                    trend_ok = False
+                    trend_reason = "15m غير صاعد"
+                elif not check_ema200_trend(formatted_symbol, "1h"):
+                    trend_ok = False
+                    trend_reason = "1h غير صاعد"
+
+            if trend_ok:
+                matched_signal = (
+                    f"[اتجاه+VWAP] EMA صاعد + فوليوم {vol_ratio:.2f}x{rsi_tag}{macd_tag}"
+                )
+            else:
+                reject_reasons.append(f"اتجاه:{trend_reason}")
+
+        # ------------------------------------------------------------------
+        # الاستراتيجية 2: انفجار البولينجر (Bollinger Squeeze Breakout)
+        # ------------------------------------------------------------------
+        if not matched_signal and enable_strat_bb_breakout:
+            if len(bb_bw) >= 12 and curr_rsi is not None:
+                avg_bw = sum(bb_bw[-11:-1]) / 10.0
+                curr_bw = bb_bw[-1]
+                prev_bw = bb_bw[-2]
+                squeeze_or_expand = (avg_bw <= 4.8) or (curr_bw > prev_bw * 1.15)
+                bullish_break = (price > op) and (price > bb_up[-1]) and (prev_close <= bb_up[-2] * 1.003)
+                vol_ok = avg_vol > 0 and volumes[-1] >= avg_vol * max(1.15, float(vol_multiplier))
+                above_key = (price > vwap) and (price > e50[-1])
+                rsi_ok = (45.0 <= curr_rsi <= 78.0)
+
+                if squeeze_or_expand and bullish_break and vol_ok and above_key and rsi_ok:
+                    matched_signal = (
+                        f"[انفجار بولينجر] اختراق علوي (عرض {curr_bw:.2f}%) + فوليوم {vol_ratio:.2f}x | RSI={curr_rsi:.1f}"
+                    )
+                else:
+                    reject_reasons.append("بولينجر:لا اختراق")
+
+        # ------------------------------------------------------------------
+        # الاستراتيجية 3: ارتداد القاع والتشبع البيعي (RSI Oversold Bounce)
+        # ------------------------------------------------------------------
+        if not matched_signal and enable_strat_rsi_bounce:
+            if len(rsi_series) >= 5 and len(bb_lo) >= 3:
+                recent_oversold = min(rsi_series[-4:-1]) <= 35.0
+                touched_lower_bb = min(lows[-3:]) <= bb_lo[-1] * 1.004
+                rsi_hook_up = (curr_rsi is not None and prev_rsi is not None and curr_rsi > prev_rsi and curr_rsi <= 55.0)
+                bullish_candle = (price > op) and (price >= (highs[-1] + lows[-1]) / 2.0)
+                vol_ok = avg_vol > 0 and volumes[-1] >= avg_vol * max(1.0, float(vol_multiplier) * 0.9)
+
+                if (recent_oversold or touched_lower_bb) and rsi_hook_up and bullish_candle and vol_ok:
+                    matched_signal = (
+                        f"[ارتداد RSI] انعكاس صاعد من قاع (RSI={curr_rsi:.1f}) + فوليوم {vol_ratio:.2f}x"
+                    )
+                else:
+                    reject_reasons.append("ارتداد:لا انعكاس")
+
+        # ------------------------------------------------------------------
+        # الاستراتيجية 4: تقاطع الزخم السريع (EMA 9/21 Cross + StochRSI)
+        # ------------------------------------------------------------------
+        if not matched_signal and enable_strat_ema_cross:
+            if len(e9) >= 3 and len(e21) >= 3 and len(stoch_k) >= 2 and len(stoch_d) >= 2:
+                fresh_cross = (e9[-1] > e21[-1]) and (e9[-2] <= e21[-2] or e9[-3] <= e21[-3])
+                stoch_bull = (stoch_k[-1] > stoch_d[-1]) and (stoch_k[-1] < 80.0)
+                bullish_candle = (price > op) and (price > vwap)
+                vol_ok = avg_vol > 0 and volumes[-1] >= avg_vol * float(vol_multiplier)
+                macd_rising = True
+                if enable_macd_filter and len(hist) >= 2:
+                    macd_rising = (hist[-1] > hist[-2])
+
+                if fresh_cross and stoch_bull and bullish_candle and vol_ok and macd_rising:
+                    matched_signal = (
+                        f"[تقاطع EMA+Stoch] تقاطع 9/21 صاعد (K={stoch_k[-1]:.0f}) + VWAP + فوليوم {vol_ratio:.2f}x"
+                    )
+                else:
+                    reject_reasons.append("تقاطع:لا إشارة")
+
+        if not matched_signal:
+            summary_rej = " | ".join(reject_reasons[:3]) if reject_reasons else "لم تتحقق شروط الاستراتيجيات"
+            return False, price, summary_rej
+
+        # بوابة الأمان المشتركة لجميع الاستراتيجيات: دفتر الأوامر + صلاحية الزوج والسبريد
         if enable_order_book_filter:
             book_ok, book_msg = check_order_book_pressure(formatted_symbol, depth_limit=20)
             if not book_ok:
-                return False, price, book_msg
+                return False, price, f"{matched_signal} -> مرفوض ({book_msg})"
+
         tradable, reason = verify_symbol_tradable_now(formatted_symbol)
         if not tradable:
             return False, price, reason
-        return True, price, f"EMA صاعد + VWAP + فوليوم {volumes[-1]/avg_vol:.2f}x{rsi_tag}{macd_tag}"
+
+        return True, price, matched_signal
     except Exception as e:
         return False, 0.0, f"خطأ: {e}"
 
@@ -1471,6 +1647,8 @@ class MainScannerThread(threading.Thread):
         opportunity_callback,
         scan_failed_callback,
         start_offset=0,
+        scan_limit=200,
+        min_quote_vol=50000.0,
         vol_multiplier=1.2,
         enable_low_price_change_filter=True,
         max_price_change_pct=0.60,
@@ -1479,6 +1657,10 @@ class MainScannerThread(threading.Thread):
         rsi_min=45.0,
         rsi_max=70.0,
         enable_macd_filter=True,
+        enable_strat_trend=True,
+        enable_strat_bb_breakout=True,
+        enable_strat_rsi_bounce=True,
+        enable_strat_ema_cross=True,
     ):
         super().__init__(daemon=True)
         self.log_callback = log_callback
@@ -1487,6 +1669,8 @@ class MainScannerThread(threading.Thread):
         self.is_running = True
         self.start_offset = start_offset
         self.last_scanned_index = 0
+        self.scan_limit = max(5, min(1500, int(scan_limit)))
+        self.min_quote_vol = max(0.0, float(min_quote_vol))
         self.vol_multiplier = float(vol_multiplier)
         self.enable_low_price_change_filter = bool(enable_low_price_change_filter)
         self.max_price_change_pct = float(max_price_change_pct)
@@ -1495,6 +1679,10 @@ class MainScannerThread(threading.Thread):
         self.rsi_min = float(rsi_min)
         self.rsi_max = float(rsi_max)
         self.enable_macd_filter = bool(enable_macd_filter)
+        self.enable_strat_trend = bool(enable_strat_trend)
+        self.enable_strat_bb_breakout = bool(enable_strat_bb_breakout)
+        self.enable_strat_rsi_bounce = bool(enable_strat_rsi_bounce)
+        self.enable_strat_ema_cross = bool(enable_strat_ema_cross)
 
     def emit_log(self, msg):
         if self.log_callback:
@@ -1509,25 +1697,29 @@ class MainScannerThread(threading.Thread):
             Clock.schedule_once(lambda dt: self.scan_failed_callback())
 
     def run(self):
-        self.emit_log("🔍 جاري جلب قائمة عملات Spot المعتمدة للتداول الفوري عبر الـ API من Gate.io...")
-        symbols = get_top_200_symbols()
+        self.emit_log(
+            f"🔍 جاري جلب أعلى {self.scan_limit} عملة Spot (سيولة >= ${self.min_quote_vol:,.0f}) من Gate.io..."
+        )
+        symbols = get_top_symbols(limit=self.scan_limit, min_quote_vol=self.min_quote_vol)
         total = len(symbols)
         if not symbols:
             self.emit_log("⚠️ تعذر جلب قائمة عملات Spot، يرجى التحقق من اتصال الإنترنت والمحاولة مجدداً.")
             self.emit_scan_failed()
             return
 
-        active_filters = [f"فوليوم > {self.vol_multiplier}x"]
-        if self.enable_low_price_change_filter:
-            active_filters.append(f"أقصى تغير <= {self.max_price_change_pct:.2f}%")
-        if self.enable_rsi_filter:
-            active_filters.append(f"RSI({self.rsi_min:.0f}-{self.rsi_max:.0f})")
-        if self.enable_macd_filter:
-            active_filters.append("MACD صاعد")
-        if self.enable_order_book_filter:
-            active_filters.append("دفتر الأوامر")
+        active_strats = []
+        if self.enable_strat_trend:
+            active_strats.append("اتجاه+VWAP")
+        if self.enable_strat_bb_breakout:
+            active_strats.append("انفجار بولينجر")
+        if self.enable_strat_rsi_bounce:
+            active_strats.append("ارتداد RSI")
+        if self.enable_strat_ema_cross:
+            active_strats.append("تقاطع EMA+Stoch")
 
-        self.emit_log(f"✅ تم جلب {total} عملة Spot نشطة ({' | '.join(active_filters)}).")
+        self.emit_log(
+            f"✅ تم جلب {total} عملة Spot نشطة | الاستراتيجيات المفعلة: {' + '.join(active_strats)}"
+        )
         offset = self.start_offset % total if total > 0 else 0
 
         while self.is_running:
@@ -1549,6 +1741,10 @@ class MainScannerThread(threading.Thread):
                     rsi_min=self.rsi_min,
                     rsi_max=self.rsi_max,
                     enable_macd_filter=self.enable_macd_filter,
+                    enable_strat_trend=self.enable_strat_trend,
+                    enable_strat_bb_breakout=self.enable_strat_bb_breakout,
+                    enable_strat_rsi_bounce=self.enable_strat_rsi_bounce,
+                    enable_strat_ema_cross=self.enable_strat_ema_cross,
                 )
                 if is_valid:
                     self.emit_log(f"[🎯 اقتناص مؤكد!] {symbol} | السعر: ${format_price(price)} | {msg}")
@@ -1908,6 +2104,7 @@ class GateioScalpKivyUI(BoxLayout):
 
         self.left_container.add_widget(self._create_api_box())
         self.left_container.add_widget(self._create_trade_config_box())
+        self.left_container.add_widget(self._create_strategies_box())
         self.left_container.add_widget(self._create_smart_tp_sl_box())
         self.left_container.add_widget(self._create_control_box())
         self.left_scroll.add_widget(self.left_container)
@@ -1990,7 +2187,16 @@ class GateioScalpKivyUI(BoxLayout):
             save_setting("trade_mode", self.get_current_trade_mode_code())
 
     def _create_trade_config_box(self):
-        card = CardBox("⚙️ إعدادات الصفقة والمؤشرات الفنية", size_hint_y=None, height=dp(265))
+        card = CardBox("⚙️ إعدادات الفحص والصفقة والمؤشرات", size_hint_y=None, height=dp(305))
+
+        row0 = GridLayout(cols=4, spacing=dp(5), size_hint_y=None, height=dp(32))
+        self.min_vol_input = make_input("50000", on_finish=lambda: save_setting("min_quote_vol", self.min_vol_input.text.strip()))
+        self.scan_count_input = make_input("200", on_finish=lambda: save_setting("scan_coin_count", self.scan_count_input.text.strip()))
+        row0.add_widget(self.min_vol_input)
+        row0.add_widget(make_label("أدنى سيولة ($):"))
+        row0.add_widget(self.scan_count_input)
+        row0.add_widget(make_label("عدد العملات:"))
+        card.add_widget(row0)
 
         row1 = GridLayout(cols=4, spacing=dp(5), size_hint_y=None, height=dp(32))
         self.vol_mult_input = make_input("1.2", on_finish=lambda: save_setting("vol_mult", self.vol_mult_input.text.strip()))
@@ -2054,6 +2260,39 @@ class GateioScalpKivyUI(BoxLayout):
             on_change=lambda v: save_setting("enable_macd_filter", int(bool(v))),
         )
         card.add_widget(self.chk_macd)
+
+        return card
+
+    def _create_strategies_box(self):
+        card = CardBox("🎯 استراتيجيات القنص المتعددة (Multi-Strategy)", size_hint_y=None, height=dp(178))
+
+        self.chk_strat_trend = CheckRow(
+            "1. اتجاه صاعد + تجميع (EMA 9/21/200 + VWAP)",
+            active=True,
+            on_change=lambda v: save_setting("enable_strat_trend", int(bool(v))),
+        )
+        card.add_widget(self.chk_strat_trend)
+
+        self.chk_strat_bb_breakout = CheckRow(
+            "2. انفجار بولينجر (Bollinger Squeeze Breakout)",
+            active=True,
+            on_change=lambda v: save_setting("enable_strat_bb_breakout", int(bool(v))),
+        )
+        card.add_widget(self.chk_strat_bb_breakout)
+
+        self.chk_strat_rsi_bounce = CheckRow(
+            "3. ارتداد القاع والتشبع البيعي (RSI Bounce)",
+            active=True,
+            on_change=lambda v: save_setting("enable_strat_rsi_bounce", int(bool(v))),
+        )
+        card.add_widget(self.chk_strat_rsi_bounce)
+
+        self.chk_strat_ema_cross = CheckRow(
+            "4. تقاطع الزخم السريع (EMA 9/21 + StochRSI)",
+            active=True,
+            on_change=lambda v: save_setting("enable_strat_ema_cross", int(bool(v))),
+        )
+        card.add_widget(self.chk_strat_ema_cross)
 
         return card
 
@@ -2271,6 +2510,8 @@ class GateioScalpKivyUI(BoxLayout):
         self.set_trade_mode_by_code(mode)
         self.api_key_input.text = get_setting("api_key", "")
         self.secret_key_input.text = get_setting("secret_key", "")
+        self.scan_count_input.text = get_setting("scan_coin_count", "200")
+        self.min_vol_input.text = get_setting("min_quote_vol", "50000")
         self.amount_input.text = get_setting("amount", "15")
         self.tp_input.text = get_setting("tp", "2.2")
         self.sl_input.text = get_setting("sl", "0.8")
@@ -2295,10 +2536,17 @@ class GateioScalpKivyUI(BoxLayout):
         self.chk_partial_tp.set_checked(get_setting("enable_partial_tp", "1") == "1")
         self.tp1_input.text = get_setting("tp1_pct", "1.0")
 
+        self.chk_strat_trend.set_checked(get_setting("enable_strat_trend", "1") == "1")
+        self.chk_strat_bb_breakout.set_checked(get_setting("enable_strat_bb_breakout", "1") == "1")
+        self.chk_strat_rsi_bounce.set_checked(get_setting("enable_strat_rsi_bounce", "1") == "1")
+        self.chk_strat_ema_cross.set_checked(get_setting("enable_strat_ema_cross", "1") == "1")
+
     def save_all_settings(self):
         save_setting("trade_mode", self.get_current_trade_mode_code())
         save_setting("api_key", self.api_key_input.text.strip())
         save_setting("secret_key", self.secret_key_input.text.strip())
+        save_setting("scan_coin_count", self.scan_count_input.text.strip())
+        save_setting("min_quote_vol", self.min_vol_input.text.strip())
         save_setting("amount", self.amount_input.text.strip())
         save_setting("tp", self.tp_input.text.strip())
         save_setting("sl", self.sl_input.text.strip())
@@ -2323,6 +2571,11 @@ class GateioScalpKivyUI(BoxLayout):
         save_setting("enable_partial_tp", int(self.chk_partial_tp.is_checked))
         save_setting("tp1_pct", self.tp1_input.text.strip())
 
+        save_setting("enable_strat_trend", int(self.chk_strat_trend.is_checked))
+        save_setting("enable_strat_bb_breakout", int(self.chk_strat_bb_breakout.is_checked))
+        save_setting("enable_strat_rsi_bounce", int(self.chk_strat_rsi_bounce.is_checked))
+        save_setting("enable_strat_ema_cross", int(self.chk_strat_ema_cross.is_checked))
+
     def get_risk_parameters(self):
         def safe_float(val, default):
             try:
@@ -2330,7 +2583,19 @@ class GateioScalpKivyUI(BoxLayout):
             except (ValueError, TypeError):
                 return default
 
+        def safe_int(val, default, lo=5, hi=1500):
+            try:
+                return max(lo, min(hi, int(float(val))))
+            except (ValueError, TypeError):
+                return default
+
         return {
+            "scan_coin_count": safe_int(self.scan_count_input.text, 200, 5, 1500),
+            "min_quote_vol": max(0.0, safe_float(self.min_vol_input.text, 50000.0)),
+            "enable_strat_trend": self.chk_strat_trend.is_checked,
+            "enable_strat_bb_breakout": self.chk_strat_bb_breakout.is_checked,
+            "enable_strat_rsi_bounce": self.chk_strat_rsi_bounce.is_checked,
+            "enable_strat_ema_cross": self.chk_strat_ema_cross.is_checked,
             "amount": safe_float(self.amount_input.text, 15.0),
             "tp": safe_float(self.tp_input.text, 2.2),
             "sl": safe_float(self.sl_input.text, 0.8),
@@ -2536,15 +2801,26 @@ class GateioScalpKivyUI(BoxLayout):
             self.scan_resume_offset = 0
 
         cfg = self.get_risk_parameters()
+        if not any((
+            cfg["enable_strat_trend"],
+            cfg["enable_strat_bb_breakout"],
+            cfg["enable_strat_rsi_bounce"],
+            cfg["enable_strat_ema_cross"],
+        )):
+            self.show_alert("تنبيه", "يرجى تفعيل استراتيجية قنص واحدة على الأقل قبل بدء البحث.")
+            return
+
         self.btn_start.disabled = True
         self.btn_stop_scan.disabled = False
-        self.append_log("[بدء] البحث عن فرصة جديدة في سوق Spot...")
+        self.append_log(f"[بدء] البحث في أعلى {cfg['scan_coin_count']} عملة Spot على Gate.io...")
 
         self.scanner_thread = MainScannerThread(
             log_callback=self.append_log,
             opportunity_callback=self.execute_snipe,
             scan_failed_callback=self.handle_scan_failed,
             start_offset=self.scan_resume_offset,
+            scan_limit=cfg["scan_coin_count"],
+            min_quote_vol=cfg["min_quote_vol"],
             vol_multiplier=cfg["vol_mult"],
             enable_low_price_change_filter=cfg["enable_low_price_chg"],
             max_price_change_pct=cfg["max_price_chg"],
@@ -2553,6 +2829,10 @@ class GateioScalpKivyUI(BoxLayout):
             rsi_min=cfg["rsi_min"],
             rsi_max=cfg["rsi_max"],
             enable_macd_filter=cfg["enable_macd_filter"],
+            enable_strat_trend=cfg["enable_strat_trend"],
+            enable_strat_bb_breakout=cfg["enable_strat_bb_breakout"],
+            enable_strat_rsi_bounce=cfg["enable_strat_rsi_bounce"],
+            enable_strat_ema_cross=cfg["enable_strat_ema_cross"],
         )
         self.scanner_thread.start()
 

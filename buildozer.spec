@@ -5,7 +5,7 @@ package.domain = org.gateioproscalperadvanced
 source.dir = .
 source.include_exts = py,png,jpg,jpeg,kv,json,txt,atlas,ttf,db
 
-version = 1.0.4
+version = 1.0.5
 
 requirements = python3,kivy==2.3.1,requests==2.32.5,urllib3,charset-normalizer,idna,certifi,arabic-reshaper,python-bidi,openssl,sqlite3
 
